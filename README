@@ -2,3 +2,460 @@ Snake Python Projekt
 Das Projekt ist ein Computerspiel, das ich für einen Kurs programmiert habe.
 Und es ist auch für die Übungen des Gits, und auch für technisches Deutsch!!!
 Nun fangen wir an.
+#include "node.hpp"
+#include "std_msgs/String.h"
+#include <image_transport/image_transport.h>
+#include <cv_bridge/cv_bridge.h>
+#include <sensor_msgs/image_encodings.h>
+#include <opencv2/imgproc/imgproc.hpp>
+#include <opencv2/highgui/highgui.hpp>
+#include <pcl_conversions/pcl_conversions.h>
+#include <boost/program_options.hpp>
+
+#include <cstdlib>
+#include <signal.h>
+#include <algorithm>
+#include <queue>
+
+#include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/path.hpp>
+
+#include <boost/ref.hpp>
+#include <boost/thread.hpp>
+
+#include <ros/ros.h>
+#include <ros/package.h>
+//#include <rct_optimizations/extrinsic_two_static_3d_camera.h>
+
+#include <message_filters/subscriber.h>
+#include <message_filters/synchronizer.h>
+#include <message_filters/sync_policies/approximate_time.h>
+#include <camera_pose_calibration/image_obs.h>
+
+using namespace sensor_msgs;
+using namespace message_filters;
+typedef sensor_msgs::PointCloud2 PclPointCloud;
+typedef pcl::PointXYZ PointXYZ;
+//using namespace std;
+//static const std::string OPENCV_WINDOW = "Image window";
+//
+#define OPENCV_WINDOWS 1
+//uint64_t g_camera_num=1;
+double get(
+    const ros::NodeHandle& n,
+    const std::string& name) {
+    double value;
+    n.getParam(name, value);
+    return value;
+}
+std::string get_string(
+    const ros::NodeHandle& n,
+    const std::string& name) {
+    std::string value;
+    n.getParam(name, value);
+    return value;
+}
+class ClientTwoCamsOpt
+{
+public:
+    ros::NodeHandle nh_;
+    ClientTwoCamsOpt(const ros::NodeHandle& n, int32_t cam_cnt);
+    ~ClientTwoCamsOpt();
+    void run(double freq);
+    void iteration(const ros::TimerEvent& e);
+    void imageCallback(const sensor_msgs::ImageConstPtr& msg, int64_t cam_index);
+    void pointcloudCallback(const sensor_msgs::PointCloud2ConstPtr& msg, int64_t cam_index);
+    void stopCallback(const std_msgs::String::ConstPtr& msg);
+    void ImageCloudFromTwoCallback(
+            const sensor_msgs::ImageConstPtr& image1,
+            const sensor_msgs::PointCloud2ConstPtr& pcl1,
+            const sensor_msgs::ImageConstPtr& image2,
+            const sensor_msgs::PointCloud2ConstPtr& pcl2);
+    ros::ServiceClient client_call;//, client_topic;
+    ros::ServiceClient client_find;
+    camera_pose_calibration::CalibrateCall srv_calicall;
+    camera_pose_calibration::FindPoints srv_findpts;
+//    camera_pose_calibration::CalibrateTopic srv_topic;
+    image_transport::ImageTransport it_;
+    std::vector<image_transport::Subscriber> image_sub_;
+    std::vector<ros::Subscriber> cloud_sub_;
+    ros::Subscriber stopping_sub;
+    uint8_t index_cam_a;
+    uint8_t index_cam_b;
+    uint8_t step;
+    bool calibrate_once;
+    message_filters::Subscriber<sensor_msgs::PointCloud2> pcl_a_sub;
+    message_filters::Subscriber<Image> img_a_sub;
+    message_filters::Subscriber<sensor_msgs::PointCloud2> pcl_b_sub;
+    message_filters::Subscriber<Image> img_b_sub;
+    std::vector<tf::StampedTransform> old_cam_tf;
+    ros::Publisher pub_imageobs;
+
+    double acc_cam_dist;
+
+    int32_t camera_cnt;
+    bool got_tf;
+    std::string topic_of_image_a;
+    std::string topic_of_cloud_a;
+    std::string name_of_color_frame_a;
+    std::string name_of_depth_frame_a;
+    std::string topic_of_image_b;
+    std::string topic_of_cloud_b;
+    std::string name_of_color_frame_b;
+    std::string name_of_depth_frame_b;
+    bool stopped;
+#if OPENCV_WINDOWS
+    std::vector<std::string> opencv_window;
+#endif
+};
+ClientTwoCamsOpt::ClientTwoCamsOpt(const ros::NodeHandle& n, int32_t cam_cnt)
+    :it_(nh_)
+    // ,srv_call(g_camera_num)
+    ,image_sub_(cam_cnt)
+    ,cloud_sub_(cam_cnt)
+    ,old_cam_tf(cam_cnt)
+    ,acc_cam_dist(0.5)
+    #if OPENCV_WINDOWS
+    ,opencv_window(cam_cnt)
+    #endif
+    ,stopped(false)
+{
+    camera_cnt=cam_cnt;//pass in the camera amount
+    ros::NodeHandle nh("~");
+
+    client_call = nh.serviceClient<camera_pose_calibration::CalibrateCall>("/calibrate_call");//this gives the tf from target to fixed camera
+    client_find = nh.serviceClient<camera_pose_calibration::FindPoints>("/calibrate_find");//this gives the points at target frame, and their position at the perspective ofcalibrated camera
+
+    ros::NodeHandle nn;
+    //parameters set the member variables, these are names of frames and topics
+    nh.param<std::string>("topic_of_image_a", topic_of_image_a, std::string("no"));
+    nh.param<std::string>("topic_of_cloud_a", topic_of_cloud_a, std::string("nono"));
+    nh.param<std::string>("name_of_color_frame_a", name_of_color_frame_a, std::string("nono"));
+    nh.param<std::string>("name_of_depth_frame_a", name_of_depth_frame_a, std::string("nono"));
+    nh.param<std::string>("topic_of_image_b", topic_of_image_b, std::string("no"));
+    nh.param<std::string>("topic_of_cloud_b", topic_of_cloud_b, std::string("nono"));
+    nh.param<std::string>("name_of_color_frame_b", name_of_color_frame_b, std::string("nono"));
+    nh.param<std::string>("name_of_depth_frame_b", name_of_depth_frame_b, std::string("nono"));
+
+    //is it ok to set the name of tag and target frame identical
+    char frame_name[32];
+    sprintf(frame_name,"target_frame");
+    srv_calicall.request.tag_frame = frame_name;
+    sprintf(frame_name,"target_frame");
+    srv_calicall.request.target_frame = frame_name;
+
+    //read yaml to get config for the server call
+    srv_calicall.request.point_cloud_scale_x = get(nn,"/camera_pose_calibration_client_two_cam_for_opt/point_cloud_scale_x");
+    srv_calicall.request.point_cloud_scale_y = get(nn,"/camera_pose_calibration_client_two_cam_for_opt/point_cloud_scale_y");
+    srv_calicall.request.pattern.pattern_width = get(nn,"/camera_pose_calibration_client_two_cam_for_opt/pattern_width");
+    srv_calicall.request.pattern.pattern_height = get(nn,"/camera_pose_calibration_client_two_cam_for_opt/pattern_height");
+    srv_calicall.request.pattern.pattern_distance = get(nn,"/camera_pose_calibration_client_two_cam_for_opt/pattern_distance");
+    //this is the distance between circles of the same row or col
+    srv_calicall.request.pattern.neighbor_distance = get(nn,"/camera_pose_calibration_client_two_cam_for_opt/neighbor_distance");//effective only if >0
+    srv_calicall.request.pattern.valid_pattern_ratio_threshold = get(nn,"/camera_pose_calibration_client_two_cam_for_opt/valid_pattern_ratio_threshold");
+
+    sprintf(frame_name,"target_frame");
+    srv_findpts.request.tag_frame = frame_name;
+    sprintf(frame_name,"target_frame");
+    srv_findpts.request.target_frame = frame_name;
+    srv_findpts.request.point_cloud_scale_x = get(nn,"/camera_pose_calibration_client_two_cam_for_opt/point_cloud_scale_x");
+    srv_findpts.request.point_cloud_scale_y = get(nn,"/camera_pose_calibration_client_two_cam_for_opt/point_cloud_scale_y");
+    srv_findpts.request.pattern.pattern_width = get(nn,"/camera_pose_calibration_client_two_cam_for_opt/pattern_width");
+    srv_findpts.request.pattern.pattern_height = get(nn,"/camera_pose_calibration_client_two_cam_for_opt/pattern_height");
+    srv_findpts.request.pattern.pattern_distance = get(nn,"/camera_pose_calibration_client_two_cam_for_opt/pattern_distance");
+    //this is the distance between circles of the same row or col
+    srv_findpts.request.pattern.neighbor_distance = get(nn,"/camera_pose_calibration_client_two_cam_for_opt/neighbor_distance");//effective only if >0
+    srv_findpts.request.pattern.valid_pattern_ratio_threshold = get(nn,"/camera_pose_calibration_client_two_cam_for_opt/valid_pattern_ratio_threshold");
+
+    acc_cam_dist = get(nn,"/camera_pose_calibration_client_two_cam_for_opt/acceptable_cam_dist_from_old");
+    //here we subscribe 4 cameras, so we do not use the names from launch, which are only for 2 active cameras
+    char msg_name[50];
+    for(size_t i=0;i<camera_cnt;i++){
+        sprintf(msg_name,"/camera%lu/color/image_raw",i+1);
+        image_sub_[i] = it_.subscribe(msg_name,1,boost::bind(&ClientTwoCamsOpt::imageCallback, this, _1, i));
+        sprintf(msg_name,"/camera%lu/depth/points",i+1);
+        cloud_sub_[i] = nh_.subscribe<sensor_msgs::PointCloud2>(msg_name,1,boost::bind(&ClientTwoCamsOpt::pointcloudCallback, this, _1, i));
+    }
+    //read yaml to get old camera pose
+    for(size_t i=0;i<camera_cnt;i++){
+        char param_name[100];
+        sprintf(param_name,"/camera_pose_calibration_client_two_cam_for_opt/table_cam%lu/x",i+1);
+        double old_x=get(nn,param_name);
+        sprintf(param_name,"/camera_pose_calibration_client_two_cam_for_opt/table_cam%lu/y",i+1);
+        double old_y=get(nn,param_name);
+        sprintf(param_name,"/camera_pose_calibration_client_two_cam_for_opt/table_cam%lu/z",i+1);
+        double old_z=get(nn,param_name);
+        tf::Vector3 old_pos(old_x,old_y,old_z);
+        sprintf(param_name,"/camera_pose_calibration_client_two_cam_for_opt/table_cam%lu/yaw",i+1);
+        double old_yaw=get(nn,param_name);
+        sprintf(param_name,"/camera_pose_calibration_client_two_cam_for_opt/table_cam%lu/pitch",i+1);
+        double old_pitch=get(nn,param_name);
+        sprintf(param_name,"/camera_pose_calibration_client_two_cam_for_opt/table_cam%lu/roll",i+1);
+        double old_roll=get(nn,param_name);
+        //from written roll pitch yaw
+        //old quaternion
+        //old rotation matrix
+        //rotate with the RotFromOld2New, result is stored in it
+        //the quaternion of the matrix is obtained in QNew
+        //the sequence of the quaternion is changed to yzwx according to python
+        //give value to the tf vector for old cameras
+        tf::Quaternion old_quart=tf::createQuaternionFromRPY(old_roll,old_pitch,old_yaw);
+  //      tf::Quaternion old_quart_changed_sequence = tf::Quaternion(old_quart.y(), old_quart.z(), old_quart.w(), old_quart.x());
+        old_cam_tf[i].setOrigin(old_pos);
+        tf::Matrix3x3 RotOld(old_quart);
+        tf::Matrix3x3 RotFromOld2New(0,0,-1,
+                                     -1,0,0,
+                                     0,1,0);
+    //    tf::Matrix3x3 RotNew = RotFromOld2New * RotOld;
+        RotFromOld2New *= RotOld;//result = RotFromOld2New * RotOld
+        tf::Quaternion QNew;
+        RotFromOld2New.getRotation(QNew);
+        tf::Quaternion new_quart_changed_sequence = tf::Quaternion(QNew.y(), QNew.z(), QNew.w(), QNew.x());
+        old_cam_tf[i].setRotation(new_quart_changed_sequence);
+    }
+    calibrate_once = false;
+    //send image_obs to opt_calibration, get the stop command from it at the end
+    pub_imageobs = nh_.advertise<camera_pose_calibration::image_obs>("image_obs",400);
+    stopping_sub = nh_.subscribe<std_msgs::String>("stopped", 1, &ClientTwoCamsOpt::stopCallback, this);
+}
+
+ClientTwoCamsOpt::~ClientTwoCamsOpt()
+{
+    ROS_INFO("Ending");
+}
+void ClientTwoCamsOpt::run(double freq)
+{
+    ros::NodeHandle node;
+    ROS_INFO("running");
+    //open the windows only for calibrating cam and reference cam
+#if OPENCV_WINDOWS
+    for(size_t i=0;i<camera_cnt;i++){
+        if(i==index_cam_a||i==index_cam_b){
+            std::stringstream ss;
+            ss<<(i+1);
+            opencv_window[i]="image window "+ss.str();
+            cv::namedWindow(opencv_window[i]);
+        }
+    }
+#endif
+//    char msg_name[50];
+//    if(step==1){
+//        index_cam_a=0;
+//        index_cam_b=2;
+//    }else if(step==2){
+//        index_cam_a=2;
+//        index_cam_b=3;
+//    }else if(step==3){
+//        index_cam_a=3;
+//        index_cam_b=1;
+//    }
+    //configuration of the synchronized messages
+    pcl_a_sub.subscribe(node, topic_of_cloud_a, 1);
+    img_a_sub.subscribe(node, topic_of_image_a, 1);
+    pcl_b_sub.subscribe(node, topic_of_cloud_b, 1);
+    img_b_sub.subscribe(node, topic_of_image_b, 1);
+    typedef sync_policies::ApproximateTime<Image, sensor_msgs::PointCloud2, Image, sensor_msgs::PointCloud2> MyApprxSyncPolicy;
+    sync_policies::ApproximateTime<Image, sensor_msgs::PointCloud2, Image, sensor_msgs::PointCloud2> my_sync_policy(4);
+    my_sync_policy.setAgePenalty(99);
+    my_sync_policy.setInterMessageLowerBound (0, ros::Duration(0.045));
+    my_sync_policy.setInterMessageLowerBound (1, ros::Duration(0.045));
+    my_sync_policy.setInterMessageLowerBound (2, ros::Duration(0.045));
+    my_sync_policy.setInterMessageLowerBound (3, ros::Duration(0.045));
+    typedef Synchronizer<MyApprxSyncPolicy> MySynchronizer;
+    MySynchronizer sync((const MyApprxSyncPolicy&)(my_sync_policy), img_a_sub, pcl_a_sub, img_b_sub, pcl_b_sub);
+    sync.registerCallback(boost::bind(&ClientTwoCamsOpt::ImageCloudFromTwoCallback, this,  _1, _2, _3, _4));
+
+    ros::Timer timer = node.createTimer(ros::Duration(1.0/freq), &ClientTwoCamsOpt::iteration, this);
+    ros::spin();
+
+}
+void ClientTwoCamsOpt::stopCallback(const std_msgs::String::ConstPtr& msg)
+{
+    stopped = true;
+}
+void ClientTwoCamsOpt::imageCallback(const sensor_msgs::ImageConstPtr& msg, int64_t cam_index)
+{
+    cv_bridge::CvImagePtr cv_ptr;
+    try{
+        cv_ptr = cv_bridge::toCvCopy(msg,sensor_msgs::image_encodings::BGR8);
+        cv::waitKey(1);
+    }
+    catch(cv_bridge::Exception& e){
+        ROS_INFO("Error");
+    }
+//    cv_ptr->toImageMsg(srv_call[cam_index].request.image);
+#if OPENCV_WINDOWS
+    if(cam_index==index_cam_a||cam_index==index_cam_b){
+        cv::imshow(opencv_window[cam_index],cv_ptr->image);
+    }
+#endif
+    cv::waitKey(3);
+}
+void ClientTwoCamsOpt::pointcloudCallback(const sensor_msgs::PointCloud2ConstPtr &msg, int64_t cam_index)
+{
+    pcl::PCLPointCloud2* cloud = new pcl::PCLPointCloud2;
+    pcl_conversions::toPCL(*msg, *cloud);
+    delete cloud;
+}
+
+void ClientTwoCamsOpt::ImageCloudFromTwoCallback(
+        const sensor_msgs::ImageConstPtr& image1,
+        const sensor_msgs::PointCloud2ConstPtr& pcl1,
+        const sensor_msgs::ImageConstPtr& image2,
+        const sensor_msgs::PointCloud2ConstPtr& pcl2)
+{
+    //convert the message PointCloud2 to the type that is usable for service
+    pcl::PCLPointCloud2* cloud_a = new pcl::PCLPointCloud2;
+    pcl::PCLPointCloud2* cloud_b = new pcl::PCLPointCloud2;
+    pcl_conversions::toPCL(*pcl1, *cloud_a);
+    pcl_conversions::toPCL(*pcl2, *cloud_b);
+    pcl_conversions::fromPCL(*cloud_a, srv_calicall.request.cloud);
+    pcl_conversions::fromPCL(*cloud_b, srv_findpts.request.cloud);
+    delete cloud_a;
+    delete cloud_b;
+    int32_t result_a=0;
+    int32_t result_b=0;
+    //get the images from msg and send to server
+    cv_bridge::CvImagePtr cv_ptr_a;
+    cv_bridge::CvImagePtr cv_ptr_b;
+//    ROS_INFO("into callback");
+    try{
+        cv_ptr_a = cv_bridge::toCvCopy(image1,sensor_msgs::image_encodings::BGR8);
+        cv::waitKey(1);
+    }
+    catch(cv_bridge::Exception& e){
+        ROS_INFO("Error");
+    }
+    try{
+        cv_ptr_b = cv_bridge::toCvCopy(image2,sensor_msgs::image_encodings::BGR8);
+        cv::waitKey(1);
+    }
+    catch(cv_bridge::Exception& e){
+        ROS_INFO("Error");
+    }
+    cv_ptr_a->toImageMsg(srv_calicall.request.image);
+    cv_ptr_b->toImageMsg(srv_findpts.request.image);
+
+    static ros::Time time_last=ros::Time::now();
+    ros::Duration time_interval=ros::Time::now()-time_last;
+    //call the server
+    if (time_interval.toSec()>0.1){
+        if(!stopped){
+            result_a=client_call.call(srv_calicall);
+            result_b=client_find.call(srv_findpts);
+            time_last=ros::Time::now();
+            if(result_a && result_b){
+//                std::cout<<"Found pattern by camera "<<index_cam_a+1<<" and "<<index_cam_b+1<<std::endl;
+
+//                static tf::TransformBroadcaster broadcaster_a;
+                // static tf::TransformBroadcaster broadcaster_b;
+//                ros::Time now = ros::Time::now();
+//                tf::Transform transform_a;// = srv_calicall.response.transform;
+//                // tf::Transform transform_b;
+//                float q0 = srv_calicall.response.transform.rotation.x;
+//                float q1 = srv_calicall.response.transform.rotation.y;
+//                float q2 = srv_calicall.response.transform.rotation.z;
+//                float q3 = srv_calicall.response.transform.rotation.w;
+//                float px = srv_calicall.response.transform.translation.x;
+//                float py = srv_calicall.response.transform.translation.y;
+//                float pz = srv_calicall.response.transform.translation.z;
+//                transform_a.setOrigin( tf::Vector3(px, py, pz) );
+//                transform_a.setRotation( tf::Quaternion(q0, q1, q2, q3) );
+//                std::cout<<"sendtrans"<<std::endl;
+//                broadcaster_a.sendTransform(tf::StampedTransform(transform_a,now,"cam_a", "target_frame"));
+//                srv_calicall.response.transform.rotation.x*=-1;
+//                srv_calicall.response.transform.rotation.y*=-1;
+//                srv_calicall.response.transform.rotation.z*=-1;
+    //Publish image points target points
+                //get the target pt, image pt and transform from server, then pass to opt_calibration
+                camera_pose_calibration::image_obs msg;
+                msg.target_points = srv_findpts.response.target_points;
+                msg.image_points = srv_findpts.response.image_points;
+                // msg.target_to_camfix = transform_a;
+                msg.target_to_camfix = srv_calicall.response.transform;
+                pub_imageobs.publish(msg);
+                calibrate_once = true;
+            }else{
+                if(result_a==0)
+                    ROS_ERROR("Failed to call service for cam a");
+                if(result_b==0)
+                    ROS_ERROR("Failed to call service for cam b");
+            }
+        }
+    }
+}
+void ClientTwoCamsOpt::iteration(const ros::TimerEvent& e)
+{
+    //only publish old tf
+//    static float time_elapse = 0;
+//    static std::vector<tf::StampedTransform> Q_tf;
+//    static size_t q_size=0;
+//    static tf::Vector3 sum_pos;
+/*Broadcast the fixed tf of cam1 to table, and the already stepcalibrated cams, Broadcast the old tf of not calibrated cams for comparing*/
+    tf::TransformBroadcaster old_tf_br;
+    char old_tf_name[20];
+    ros::Time now = ros::Time::now();
+    switch (step) {
+    case 1://cam 1 is fixed
+        sprintf(old_tf_name,"/fixed_cam1");
+        old_tf_br.sendTransform(tf::StampedTransform(old_cam_tf[0],now,"table", old_tf_name));
+        for(size_t i=1;i<camera_cnt;i++){
+            sprintf(old_tf_name,"/old_cam%lu",i+1);
+            old_tf_br.sendTransform(tf::StampedTransform(old_cam_tf[i],now,"table", old_tf_name));
+        }
+        break;
+    case 2://cam 1 and 3 fixed
+        sprintf(old_tf_name,"/fixed_cam1");
+        old_tf_br.sendTransform(tf::StampedTransform(old_cam_tf[0],now,"table", old_tf_name));
+        sprintf(old_tf_name,"/fixed_cam3");
+        old_tf_br.sendTransform(tf::StampedTransform(old_cam_tf[2],now,"table", old_tf_name));
+        sprintf(old_tf_name,"/old_cam2");
+        old_tf_br.sendTransform(tf::StampedTransform(old_cam_tf[1],now,"table", old_tf_name));
+        sprintf(old_tf_name,"/old_cam4");
+        old_tf_br.sendTransform(tf::StampedTransform(old_cam_tf[3],now,"table", old_tf_name));
+        break;
+    case 3:
+        sprintf(old_tf_name,"/fixed_cam1");
+        old_tf_br.sendTransform(tf::StampedTransform(old_cam_tf[0],now,"table", old_tf_name));
+        sprintf(old_tf_name,"/fixed_cam3");
+        old_tf_br.sendTransform(tf::StampedTransform(old_cam_tf[2],now,"table", old_tf_name));
+        sprintf(old_tf_name,"/fixed_cam4");
+        old_tf_br.sendTransform(tf::StampedTransform(old_cam_tf[3],now,"table", old_tf_name));
+        sprintf(old_tf_name,"/old_cam2");
+        old_tf_br.sendTransform(tf::StampedTransform(old_cam_tf[1],now,"table", old_tf_name));
+        break;
+    default:
+        break;
+    }
+}
+int main (int argc, char **argv)
+{
+    ros::init(argc, argv, "camera_two_cali_opt");
+    ros::NodeHandle n("~");
+    int32_t camera_count;
+    int32_t index_cam_a;
+    int32_t index_cam_b;
+    n.param("camera_count", camera_count,1);
+    n.param("chosen_camera_a", index_cam_a,1);
+    n.param("chosen_camera_b", index_cam_b,1);
+    ClientTwoCamsOpt client_two_cam(n, camera_count);
+    client_two_cam.index_cam_a = index_cam_a-1;
+    client_two_cam.index_cam_b = index_cam_b-1;
+    uint8_t index_sum = client_two_cam.index_cam_a + client_two_cam.index_cam_b;
+    if(index_sum ==2){
+        client_two_cam.step = 1;
+        ROS_INFO("Camera index 1 given!");
+    }
+    else if (index_sum == 5){
+        client_two_cam.step = 2;
+        ROS_INFO("Camera index 2 given!");
+    }
+    else if (index_sum ==4){
+        client_two_cam.step = 3;
+        ROS_INFO("Camera index 3 given!");
+    }
+    else
+        ROS_INFO("Camera index wrong given!");
+    client_two_cam.run(5.0);
+    return 0;
+}
